@@ -12,11 +12,11 @@ inputs:
   version:
     description: trivy release to install (checksum-verified).
     required: false
-    default: "0.58.1"
+    default: "0.76.2"
   db-repository:
-    description: Vulnerability DB sources, tried in order (a mirror avoids registry rate limits).
+    description: Optional vulnerability DB source override (a mirror avoids registry rate limits). Empty uses trivy's default.
     required: false
-    default: "public.ecr.aws/aquasecurity/trivy-db:2,ghcr.io/aquasecurity/trivy-db:2"
+    default: ""
 
 runs:
   using: "composite"
@@ -40,9 +40,10 @@ runs:
       shell: bash
       env:
         SEVERITY: ${{ inputs.severity }}
-        TRIVY_DB_REPOSITORY: ${{ inputs.db-repository }}
+        DB_REPOSITORY: ${{ inputs.db-repository }}
       run: |
         set -euo pipefail
+        if [ -n "$DB_REPOSITORY" ]; then export TRIVY_DB_REPOSITORY="$DB_REPOSITORY"; fi
         if [ ! -f .ci/image.ref ] || [ ! -f .ci/image.tar ]; then
           echo "::error::.ci/image.{ref,tar} not found. build-image must run earlier in the SAME job: the two share a workspace, not a registry."
           exit 1
