@@ -1,0 +1,111 @@
+name: ci
+
+# The golden pipeline. Service repos call this with a 12-line workflow.
+# The four checks are composite actions (steps that share one job's workspace);
+# the pipeline itself is a reusable workflow (a whole job graph with its own
+# runners and permissions). See README.md.
+
+on:
+  workflow_call:
+    inputs:
+      context:
+        description: Docker build context.
+        type: string
+        default: "."
+      dockerfile:
+        description: Dockerfile path.
+        type: string
+        default: "Dockerfile"
+      image-name:
+        description: Image name. Defaults to the caller's repository name.
+        type: string
+        default: ""
+    outputs:
+      digest:
+        description: Digest of the image pushed to GHCR (sha256:...).
+        value: ${{ jobs.publish.outputs.digest }}
+      image:
+        description: Image reference without a tag, for example ghcr.io/owner/name.
+        value: ${{ jobs.publish.outputs.image }}
+
+jobs:
+  ci:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hvohra/platform-workflows/actions/lint@v1
+
+      # Before build-image on purpose: .ci/image.tar would otherwise be scanned too.
+      - uses: hvohra/platform-workflows/actions/secret-scan@v1
+
+      - id: build
+        uses: hvohra/platform-workflows/actions/build-image@v1
+        with:
+          context: ${{ inputs.context }}
+          dockerfile: ${{ inputs.dockerfile }}
+          image-name: ${{ inputs.image-name }}
+
+      # No inputs pointing at build's output: it reads .ci/ from the workspace.
+      - uses: hvohra/platform-workflows/actions/image-scan@v1
+
+      # Hand the exact scanned image to the publish job. Publishing a rebuild
+      # would mean the thing pushed is not the thing that was scanned.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: .ci/
+          retention-days: 1
+
+  publish:
+    needs: ci
+    runs-on: ubuntu-24.04
+    # A called workflow cannot ask for more than its caller granted, and the
+    # caller grants only packages and id-token. Requesting contents: here would
+    # be a startup failure.
+    permissions:
+      packages: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      image: ${{ steps.push.outputs.image }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: image
+          path: .ci
+
+      - name: Load the image that was scanned
+        run: docker load --input .ci/image.tar
+
+      - name: Log in to GHCR
+        env:
+          TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: echo "$TOKEN" | docker login ghcr.io --username "$ACTOR" --password-stdin
+
+      - name: Push and capture the digest
+        id: push
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          local_ref="$(cat .ci/image.ref)"
+          name="${IMAGE_NAME:-${GITHUB_REPOSITORY#*/}}"
+          image="ghcr.io/${OWNER,,}/${name}"
+
+          docker tag "$local_ref" "${image}:${GITHUB_SHA::12}"
+          docker push "${image}:${GITHUB_SHA::12}" | tee push.log
+
+          # The line is: "<tag>: digest: sha256:<64 hex> size: <n>"
+          digest="$(grep -E ': digest: sha256:' push.log | grep -oE 'sha256:[a-f0-9]{64}' | tail -1)"
+          test -n "$digest"
+
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Published"
+            echo "- Image: \`${image}\`"
+            echo "- Digest: \`${digest}\`"
+            echo "- Pull by digest: \`${image}@${digest}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

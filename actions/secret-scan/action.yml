@@ -1,0 +1,39 @@
+name: secret-scan
+description: Run gitleaks over the working tree and fail the step on any finding. The CI half of the pre-commit hook.
+
+inputs:
+  path:
+    description: Directory to scan, relative to the caller's workspace.
+    required: false
+    default: "."
+  version:
+    description: gitleaks release to install (checksum-verified).
+    required: false
+    default: "8.21.2"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install gitleaks
+      shell: bash
+      env:
+        GITLEAKS_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+        tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+        cd "$RUNNER_TEMP"
+        curl -fsSL -O "${base}/${tarball}"
+        curl -fsSL -O "${base}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+        grep " ${tarball}\$" "gitleaks_${GITLEAKS_VERSION}_checksums.txt" | sha256sum -c -
+        tar -xzf "$tarball" gitleaks
+        sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+
+    - name: Scan working tree
+      shell: bash
+      env:
+        SCAN_PATH: ${{ inputs.path }}
+      run: |
+        # --no-git scans the files as they are on disk, not the history.
+        # --redact keeps a leaked secret out of the CI log.
+        gitleaks detect --no-git --no-banner --redact --exit-code 1 --source "$SCAN_PATH"

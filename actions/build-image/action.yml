@@ -1,0 +1,57 @@
+name: build-image
+description: >
+  Build the container image locally. Does not push. Leaves the image in the
+  runner's docker daemon AND as a tarball plus a ref file under .ci/ in the
+  workspace, so the next step (image-scan) can find it with no registry path.
+
+inputs:
+  context:
+    description: Docker build context, relative to the caller's workspace.
+    required: false
+    default: "."
+  dockerfile:
+    description: Dockerfile path, relative to the caller's workspace.
+    required: false
+    default: "Dockerfile"
+  image-name:
+    description: Local image name. Defaults to the repository name.
+    required: false
+    default: ""
+
+outputs:
+  tag:
+    description: The local image tag that was built (for example local/svc-hello:<sha>).
+    value: ${{ steps.build.outputs.tag }}
+  tarball:
+    description: Workspace-relative path of the saved image tarball.
+    value: ${{ steps.build.outputs.tarball }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Build
+      id: build
+      shell: bash
+      env:
+        CONTEXT: ${{ inputs.context }}
+        DOCKERFILE: ${{ inputs.dockerfile }}
+        IMAGE_NAME: ${{ inputs.image-name }}
+      run: |
+        set -euo pipefail
+        name="${IMAGE_NAME:-${GITHUB_REPOSITORY#*/}}"
+        tag="local/${name}:${GITHUB_SHA}"
+
+        docker build \
+          --file "$DOCKERFILE" \
+          --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+          --tag "$tag" \
+          "$CONTEXT"
+
+        # The hand-off. The workspace is shared by every step of the caller's
+        # job, so these two files are the whole interface to image-scan.
+        mkdir -p .ci
+        docker save --output .ci/image.tar "$tag"
+        echo "$tag" > .ci/image.ref
+
+        echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+        echo "tarball=.ci/image.tar" >> "$GITHUB_OUTPUT"

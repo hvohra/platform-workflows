@@ -1,0 +1,64 @@
+name: image-scan
+description: >
+  Run trivy against the image that build-image produced earlier in the same job.
+  It is passed no image name and no registry path: it reads .ci/ from the shared
+  workspace.
+
+inputs:
+  severity:
+    description: Comma-separated severities that fail the step.
+    required: false
+    default: "HIGH,CRITICAL"
+  version:
+    description: trivy release to install (checksum-verified).
+    required: false
+    default: "0.58.1"
+  db-repository:
+    description: Vulnerability DB sources, tried in order (a mirror avoids registry rate limits).
+    required: false
+    default: "public.ecr.aws/aquasecurity/trivy-db:2,ghcr.io/aquasecurity/trivy-db:2"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install trivy
+      shell: bash
+      env:
+        TRIVY_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        base="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"
+        tarball="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+        cd "$RUNNER_TEMP"
+        curl -fsSL -O "${base}/${tarball}"
+        curl -fsSL -O "${base}/trivy_${TRIVY_VERSION}_checksums.txt"
+        grep " ${tarball}\$" "trivy_${TRIVY_VERSION}_checksums.txt" | sha256sum -c -
+        tar -xzf "$tarball" trivy
+        sudo install -m 0755 trivy /usr/local/bin/trivy
+
+    - name: Scan the image build-image produced
+      shell: bash
+      env:
+        SEVERITY: ${{ inputs.severity }}
+        TRIVY_DB_REPOSITORY: ${{ inputs.db-repository }}
+      run: |
+        set -euo pipefail
+        if [ ! -f .ci/image.ref ] || [ ! -f .ci/image.tar ]; then
+          echo "::error::.ci/image.{ref,tar} not found. build-image must run earlier in the SAME job: the two share a workspace, not a registry."
+          exit 1
+        fi
+        ref="$(cat .ci/image.ref)"
+        echo "Scanning ${ref} from .ci/image.tar"
+
+        trivy image \
+          --input .ci/image.tar \
+          --scanners vuln \
+          --severity "$SEVERITY" \
+          --ignore-unfixed \
+          --exit-code 1 \
+          --no-progress
+
+        {
+          echo "### image-scan"
+          echo "Scanned \`${ref}\` (from the workspace, not a registry). No ${SEVERITY} findings with a fix available."
+        } >> "$GITHUB_STEP_SUMMARY"
