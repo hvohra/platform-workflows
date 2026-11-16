@@ -20,6 +20,14 @@ on:
         description: Image name. Defaults to the caller's repository name.
         type: string
         default: ""
+      env-repo:
+        description: Repo that holds desired state. Defaults to <owner>/env-dev.
+        type: string
+        default: ""
+    secrets:
+      ENV_REPO_TOKEN:
+        description: Token that can open pull requests on the env repo and nothing else.
+        required: true
     outputs:
       digest:
         description: Digest of the image pushed to GHCR (sha256:...).
@@ -111,3 +119,56 @@ jobs:
             echo "- Digest: \`${digest}\`"
             echo "- Pull by digest: \`${image}@${digest}\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Promotion is a pull request, never a push. This job opens it; a named human
+  # merges it; the cluster pulls the merge. Nothing here can deploy.
+  promote:
+    needs: publish
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - name: Open a one-line promotion PR against the env repo
+        env:
+          GH_TOKEN: ${{ secrets.ENV_REPO_TOKEN }}
+          DIGEST: ${{ needs.publish.outputs.digest }}
+          IMAGE_NAME: ${{ inputs.image-name }}
+          ENV_REPO: ${{ inputs.env-repo }}
+        run: |
+          set -euo pipefail
+          name="${IMAGE_NAME:-${GITHUB_REPOSITORY#*/}}"
+          env_repo="${ENV_REPO:-${GITHUB_REPOSITORY_OWNER}/env-dev}"
+          values="values/${name}.yaml"
+          branch="promote/${name}-${GITHUB_SHA::12}"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          git clone --quiet "https://x-access-token:${GH_TOKEN}@github.com/${env_repo}.git" env
+          cd env
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+
+          # The only line the pipeline is allowed to change.
+          sed -i -E "s|^(  digest: ).*|\1${DIGEST}|" "$values"
+
+          if git diff --quiet; then
+            echo "Digest already ${DIGEST} in ${values}; nothing to promote."
+            exit 0
+          fi
+
+          # Fail closed if the edit was not exactly one line replaced by one line.
+          stat="$(git diff --numstat -- "$values" | awk '{a+=$1; d+=$2} END {print a" "d}')"
+          if [ "$stat" != "1 1" ]; then
+            echo "::error::Expected a 1-line change, got (added removed) = ${stat}"
+            git diff
+            exit 1
+          fi
+
+          git commit --quiet --all --message "Promote ${name} to ${DIGEST:0:19}"
+          git push --quiet origin "$branch"
+
+          gh pr create \
+            --repo "$env_repo" \
+            --base main \
+            --head "$branch" \
+            --title "Promote ${name}: ${DIGEST:0:19}" \
+            --body "$(printf 'Changes one line: `image.digest` in `%s`.\n\n- Digest: `%s`\n- Source commit: %s/%s/commit/%s\n- Pipeline run: %s\n\nMerging this is the approval. Flux deploys the merge. To roll back, revert the merge commit.' "$values" "$DIGEST" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_SHA" "$run_url")"
